@@ -1,0 +1,1364 @@
+# ============================================================================== 
+# MASTER SCRIPT: ADAPTIVE MOMENTUM (OMX HELSINKI ALL-SHARE) 
+# Metodologi: Jegadeesh & Titman (1993) - Overlapping Portfolios 
+# Version: FINAL (Includes SPX Benchmark, CAPM & Dynamic Rf & Triple Scenario) 
+# ============================================================================== 
+
+# 1. SETUP & PAKET 
+# ------------------------------------------------------------------------------ 
+if (!require("pacman")) install.packages("pacman") 
+pacman::p_load(Rblpapi, tidyverse, tidyquant, PerformanceAnalytics, xts, lubridate, gridExtra) 
+
+
+# --- GLOBAL KONFIGURATION --- 
+DOWNLOAD_NEW_DATA <- FALSE   # TRUE för att få data, False då du har data 
+DATA_FILENAME     <- "omxh_thesis_data.rds" 
+
+
+# Studieperiod (2006 - Idag) 
+START_DATE <- as.Date("2006-01-01") 
+END_DATE   <- as.Date("2026-02-02") # Dagens datum 
+
+
+# Kostnader (Realism-justerad för 200k EUR portfölj) 
+# 0.25% täcker både courtage och "slippage" (spread) i småbolag 
+TRANS_COST <- 0.0025 
+
+
+# ==============================================================================
+# SEKTION A: DATAHÄMTNING (BLOOMBERG-INTEGRATION & SURVIVORSHIP BIAS)
+# ==============================================================================
+if (DOWNLOAD_NEW_DATA) {
+  message("🔌 Ansluter till Bloomberg...")
+  con <- blpConnect()
+  # 1. UNIVERSUM (Inkluderar logik för att motverka Survivorship Bias)
+  message("--- FAS 1: Hämtar Universum ---")
+  live_members <- bds("HEX Index", "INDX_MWEIGHT")
+  live_tickers <- paste(live_members$`Member Ticker and Exchange Code`, "Equity")
+  
+  # Fail-safe integration av avlistade bolag
+  if (file.exists("dead_tickers.csv")) {
+    dead_df <- read_csv("dead_tickers.csv", show_col_types = FALSE)
+    if(!"Ticker" %in% names(dead_df)) colnames(dead_df)[1] <- "Ticker"
+    
+    # Säkerställ rätt format för Bloomberg-tickers
+    dead_tickers <- ifelse(grepl(" Equity$", dead_df$Ticker), 
+                           dead_df$Ticker, 
+                           paste(dead_df$Ticker, "Equity"))
+    
+    full_universe <- unique(c(live_tickers, dead_tickers))
+    message(paste("✅ Inkluderar", length(dead_tickers), "avlistade bolag från CSV."))
+  } else {
+    full_universe <- live_tickers
+    message("ℹ️ dead_tickers.csv saknas. Fortsätter med enbart nuvarande indexmedlemmar.")
+  }
+  
+  
+  
+  # 2. AKTIESPECIFIK DATA (PRIS + NYA METRICS)
+  message("--- FAS 2: Hämtar Pris & Fundamentaldata ---")
+  # Vi inkluderar alla begärda fält för analys av värdering och risk
+  fields <- c("TOT_RETURN_INDEX_GROSS_DVDS", "PX_VOLUME",   
+              "PE_RATIO", "PX_TO_BOOK_RATIO", "EQY_DVD_YLD_12M",   
+              "NET_DEBT_TO_EBITDA", "RSI_14D", "PX_BID", "PX_ASK")
+  
+  raw_stock_data <- bdh(full_universe, fields, start.date = START_DATE, end.date = END_DATE, 
+                        options = c("periodicitySelection" = "MONTHLY", 
+                                    "adjustmentNormal" = "TRUE", 
+                                    "adjustmentAbnormal" = "TRUE", 
+                                    "adjustmentSplit" = "TRUE"))
+  
+  df_stocks <- bind_rows(raw_stock_data, .id = "ticker") %>%  
+    as_tibble() %>%  
+    rename(price = TOT_RETURN_INDEX_GROSS_DVDS, volume = PX_VOLUME)
+  
+  # 3. FUNDAMENTA (Market Cap & Analytikerdata)
+  message("--- FAS 3: Hämtar Market Cap & Recs ---")
+  fund_fields <- c("CUR_MKT_CAP", "TOT_ANALYST_REC")
+  raw_fund <- bdh(full_universe, fund_fields, start.date = START_DATE, end.date = END_DATE, 
+                  options = c("periodicitySelection" = "MONTHLY"))
+  df_fund <- bind_rows(raw_fund, .id = "ticker") %>% as_tibble()
+  
+  # 4. MAKRO, INDEX & VIX (Benchmarks & Marknadsskräck)
+  message("--- FAS 4: Hämtar Index, Makro & V2X ---")
+  index_fields <- c("PX_LAST", "VOLATILITY_30D", "TURNOVER")
+  # OMXH25GI = Gross Index (Total Return)
+  index_data <- bdh("OMXH25GI Index", index_fields, start.date = START_DATE, end.date = END_DATE, 
+                    options = c("periodicitySelection" = "MONTHLY"))
+  
+  # S&P 500 Total Return (SPXT) omräknat till EUR för korrekt jämförelse
+  spx_data <- bdh("SPXT Index", "PX_LAST", start.date = START_DATE, end.date = END_DATE, 
+                  options = c("periodicitySelection" = "MONTHLY", "currency" = "EUR"))
+  
+  # Risk-free rate (3M Euribor)
+  rf_data <- bdh("EUR003M Index", "PX_LAST", start.date = START_DATE, end.date = END_DATE, 
+                 options = c("periodicitySelection" = "MONTHLY"))
+  
+  # V2X (Euro Stoxx 50 Volatility) - Bättre global indikator för risk-off
+  vix_data <- bdh("V2X Index", "PX_LAST", start.date = START_DATE, end.date = END_DATE, 
+                  options = c("periodicitySelection" = "MONTHLY"))
+  
+  # 5. SAMMANSTÄLL OCH SPARA
+  master_data <- list(stocks = df_stocks, 
+                      fund = df_fund, 
+                      index = index_data,   
+                      spx = spx_data, 
+                      rf = rf_data, 
+                      vix = vix_data)
+  
+  saveRDS(master_data, DATA_FILENAME)
+  message(paste("✅ All data (inkl V2X & Fundamentals) sparad till", DATA_FILENAME))
+  
+} else {
+  master_data <- readRDS(DATA_FILENAME)
+  message("✅ Laddade sparad data.")
+}
+
+# ==============================================================================
+# SEKTION B: PREPROCESSING & BUFFERED MOMENTUM ENGINE
+# ==============================================================================
+message("\n🏗️ --- PREPROCESSING: CLEANING & BUFFER LOGIC ---")
+
+# 1. HJÄLPFUNKTION: Tvinga datum till sista dagen i månaden
+to_last_day <- function(d) {
+  lubridate::ceiling_date(as.Date(d), "month") - 1
+}
+
+GLOBAL_LAST_DATE <- to_last_day(max(master_data$stocks$date, na.rm = TRUE))
+
+# 2. RISK-FREE RATE (3M EURIBOR)
+rf_clean <- master_data$rf %>%
+  mutate(date = to_last_day(date)) %>%
+  group_by(date) %>%
+  summarise(RF_Monthly = mean(PX_LAST, na.rm=TRUE) / 100 / 12) %>% 
+  ungroup()
+
+# 3. UNIVERSUM: CLEANING, DELISTING & LIKVIDITET
+df_universe <- master_data$stocks %>%
+  mutate(date = to_last_day(date)) %>%
+  arrange(ticker, date) %>%
+  group_by(ticker) %>%
+  filter(n() >= 7) %>% 
+  mutate(
+    price = na.locf(price, na.rm = FALSE, maxgap = 3),
+    ret_1m = price / lag(price) - 1,
+    turnover_eur = price * volume,
+    turnover_3m_avg = zoo::rollmean(turnover_eur, k = 3, fill = NA, align = "right")
+  ) %>%
+  # Delisting Logic: Konkurs-proxy (-100%) vid avlistning
+  mutate(
+    last_obs_date = max(date),
+    is_delisted = (last_obs_date < (GLOBAL_LAST_DATE - months(1))),
+    # SMART DELISTING: Only Bankruptcy (Price < 0.10) gets -100%. Acquisitions keep market price.
+    ret_1m = if_else(is_delisted & date == last_obs_date & price < 0.10, -1, ret_1m)
+  ) %>%
+  ungroup() %>%
+  # JOIN MARKET CAP FIRST
+  left_join(master_data$fund %>% mutate(date = to_last_day(date)) %>% select(ticker, date, CUR_MKT_CAP), by = c("ticker", "date")) %>%
+  group_by(ticker) %>%
+  fill(CUR_MKT_CAP, .direction = "down") %>%
+  ungroup() %>%
+  # THEN FILTER (REALISTIC FILTERS):
+  # 1. Turnover Floor: > 25,000 EUR daily avg (Executability)
+  # 2. Market Cap Floor: > 25 MEUR (Avoids shell companies/First North penny stocks)
+  filter(
+    (turnover_3m_avg >= 25000 | is.na(turnover_3m_avg)),
+    CUR_MKT_CAP > 25
+  ) %>%
+  filter(is.finite(ret_1m))
+
+# 4. UPPDATERAD MODUL: BUFFERED MOMENTUM ENGINE (DYNAMISKA KOSTNADER)
+run_buffered_engine <- function(df_univ, n_buy = 10, n_sell = 15, form = 6, skip = 1, cost_pct = 0.0025) {
+  
+  df_mom <- df_univ %>%
+    group_by(ticker) %>%
+    mutate(mom_metric = lag(price, skip) / lag(price, form + skip) - 1) %>%
+    ungroup() %>% drop_na(mom_metric) %>% arrange(date)
+  
+  dates <- unique(df_mom$date)
+  current_portfolio <- c()
+  history <- list()
+  
+  for (i in seq_along(dates)) {
+    d <- dates[i]
+    today <- df_mom %>% filter(date == d)
+    today <- today %>% mutate(rank = min_rank(desc(mom_metric)))
+    prev_portfolio <- current_portfolio
+    
+    # A. SÄLJ-LOGIK
+    if (length(current_portfolio) > 0) {
+      current_ranks <- today %>% filter(ticker %in% current_portfolio)
+      current_portfolio <- current_ranks %>% filter(rank <= n_sell) %>% pull(ticker)
+    }
+    
+    # B. KÖP-LOGIK
+    needed <- n_buy - length(current_portfolio)
+    if (needed > 0) {
+      new_buys <- today %>% 
+        filter(!(ticker %in% current_portfolio)) %>%
+        arrange(rank) %>% slice(1:needed) %>% pull(ticker)
+      current_portfolio <- c(current_portfolio, new_buys)
+    }
+    
+    # C. TURNOVER-BERÄKNING (Faktisk omsättning)
+    if (length(prev_portfolio) > 0) {
+      num_changes <- length(setdiff(current_portfolio, prev_portfolio))
+      turnover <- num_changes / n_buy
+    } else {
+      turnover <- 1.0 # Första köpet
+    }
+    
+    # D. BERÄKNA NETTOAVKASTNING
+    if (length(current_portfolio) > 0) {
+      raw_ret <- today %>% filter(ticker %in% current_portfolio) %>% 
+        summarise(m_ret = mean(ret_1m, na.rm=TRUE)) %>% pull(m_ret)
+      
+      # Kostnad baseras på turnover (sälj + köp = 2*turnover)
+      actual_cost <- if(i == 1) 0 else (turnover * 2) * cost_pct
+      history[[i]] <- data.frame(date = d, ret_raw = raw_ret, ret_net = raw_ret - actual_cost, turnover = turnover)
+    }
+  }
+  return(bind_rows(history))
+}
+
+# 5. BENCHMARK SYNC
+bench_omx <- master_data$index %>%
+  mutate(date = to_last_day(date)) %>%
+  arrange(date) %>%
+  mutate(OMXH25 = PX_LAST / lag(PX_LAST) - 1) %>%
+  select(date, OMXH25) %>% drop_na()
+
+message("✅ Sektion B klar inkl. Turnover-Engine.")
+
+# ------------------------------------------------------------------------------
+# 6. MISSING MODULE: STANDARD STRATEGY ENGINE (JEGADEESH & TITMAN)
+# ------------------------------------------------------------------------------
+run_strategy_engine <- function(df_univ, form_months, hold_months, strategy_mode = "MOM_LONG") {
+  
+  # 1. SETUP: Dates & Indices
+  dates <- sort(unique(df_univ$date))
+  date_map <- data.frame(date = dates, idx = seq_along(dates))
+  
+  # 1. CALCULATE MOMENTUM SIGNAL & FILTERS
+  skip <- 1
+  
+  # We separate Metrics from Returns to ensure we don't drop valid return observations
+  # just because the momentum metric isn't defined for that specific date.
+  df_metrics <- df_univ %>%
+    group_by(ticker) %>%
+    arrange(date) %>%
+    mutate(
+      # Standard Jegadeesh & Titman (1993) Momentum
+      # P(t-1) / P(t-1-Formation) - 1
+      mom_metric = lag(price, skip) / lag(price, form_months + skip) - 1,
+      # Helper for Reversal Filter: Return of the last month (Formation Month)
+      # P(t-1) / P(t-2) - 1. Used to check if the "knife has stopped falling".
+      ret_1m_formation = lag(price, 1) / lag(price, 2) - 1
+    ) %>%
+    ungroup() %>% 
+    # Strict filter: Must have momentum signal AND current market cap
+    # We do NOT filter by ret_1m here to avoid Look-Ahead Bias (we don't know next month's return yet)
+    filter(!is.na(mom_metric)) %>%
+    select(date, ticker, mom_metric, ret_1m_formation, CUR_MKT_CAP)
+    
+  # Returns lookup table (Full Universe) - ENSURE UNIQUE KEYS
+  df_returns <- df_univ %>% 
+    select(date, ticker, ret_1m) %>%
+    distinct(date, ticker, .keep_all = TRUE)
+  
+  # 3. VECTORIZED RANKING & SELECTION (ONE PASS)
+  # Detect modes
+  is_val_strat <- strategy_mode %in% c("CONTRARIAN_LONG", "CONTRARIAN_REVERSAL")
+  is_reversal  <- strategy_mode == "CONTRARIAN_REVERSAL"
+
+  df_selected <- df_metrics %>%
+    group_by(date) %>%
+    mutate(
+      n = n(),
+      is_valid = n >= 10,
+      rank_val = if_else(is_valid, min_rank(mom_metric), NA_integer_),
+      n_select = if_else(is_valid, max(5, ceiling(n * 0.1)), 0)
+    ) %>%
+    filter(is_valid) %>%
+    mutate(
+      is_short_candidate = (rank_val <= n_select),
+      
+      # REVERSAL FILTER: If we are in "Reversal" mode, we only buy losers if they are BOUNCING (Positive 1M Return)
+      # If not in reversal mode, we take all losers.
+      # Fix: Use logical OR instead of if_else(scalar, vector, scalar) to avoid strict recycling errors.
+      pass_reversal_filter = !is_reversal | (ret_1m_formation > 0),
+      
+      # STRICT SHORT RULE: Must be > 500M Market Cap to be borrowable (unless buying losers)
+      # For Reversal strategy, we are buying losers, so we allow small caps but apply the Reversal Filter.
+      is_short_valid = is_short_candidate & (CUR_MKT_CAP > 500 | is_val_strat) & pass_reversal_filter,
+      
+      side = case_when(
+        rank_val > (n - n_select) ~ "LONG", 
+        is_short_valid            ~ "SHORT", # Only valid (large) shorts (or all losers in Value strat)
+        TRUE                      ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(side)) %>%
+    select(date_form = date, ticker, side) %>%
+    ungroup()
+  
+  # 4. EXPAND HOLDINGS (OVERLAPPING PORTFOLIOS)
+  # Map Formation Date to Index
+  df_selected <- df_selected %>% left_join(date_map, by = c("date_form" = "date"))
+  
+  lags <- 1:hold_months
+  
+  # Expand
+  df_expanded <- df_selected %>%
+    slice(rep(1:n(), each = length(lags))) %>%
+    mutate(lag = rep(lags, times = nrow(df_selected))) %>%
+    mutate(idx_obs = idx + lag) %>%
+    filter(idx_obs <= length(dates)) 
+  
+  # Map back to Observation Date
+  df_expanded <- df_expanded %>%
+    left_join(date_map, by = c("idx_obs" = "idx")) %>%
+    select(date_obs = date, ticker, side)
+  
+  # 5. JOIN RETURNS & AGGREGATE
+  # Join with FULL returns table, not the filtered metrics table
+  df_portfolio_returns <- df_expanded %>%
+    left_join(df_returns, by = c("date_obs" = "date", "ticker" = "ticker")) %>%
+    group_by(date_obs, side) %>%
+    summarise(mean_ret = mean(ret_1m, na.rm = TRUE), .groups = "drop")
+  
+  # 6. CALCULATE STRATEGY RETURN
+  # Pivot to Wide
+  # CRITICAL FIX: values_fill = NA ensures we require BOTH legs to exist.
+  # If Short leg is missing, result is NA -> 0. Prevents accidental 100% Long exposure.
+  df_final <- df_portfolio_returns %>%
+    pivot_wider(names_from = side, values_from = mean_ret, values_fill = NA) %>%
+    mutate(
+      STRAT = case_when(
+        strategy_mode == "MOM_LONG"      ~ LONG,
+        strategy_mode == "MOM_LS"        ~ LONG - SHORT,
+        strategy_mode == "CONTRARIAN"    ~ SHORT - LONG, 
+        strategy_mode == "CONTRARIAN_LONG" ~ SHORT, # Buying the "Losers" (Short side buckets)
+        strategy_mode == "CONTRARIAN_REVERSAL" ~ SHORT, # Buying the "Bouncing Losers"
+        TRUE                             ~ 0
+      )
+    ) %>%
+    mutate(STRAT = replace_na(STRAT, 0)) %>% # Logic check: If NA (missing leg), return 0
+    select(date = date_obs, ret = STRAT) %>%
+    arrange(date)
+  
+  # Rename column
+  colnames(df_final)[2] <- strategy_mode
+  
+  return(df_final)
+}
+
+# ==============================================================================
+# SEKTION C: STRATEGY EXECUTION (NET OF COSTS)
+# ==============================================================================
+message("\n⚙️ --- EXEKVERAR STRATEGIER (NETTO) ---")
+
+# Kör huvudstrategin med Buffer-logik (Köp 20, Sälj 25)
+res_main <- run_buffered_engine(df_universe, n_buy = 20, n_sell = 25, cost_pct = TRANS_COST)
+
+# Vi använder 'ret_net' för att alla efterföljande Sharpe-kvoter ska vara sanna
+res_long <- res_main %>% select(date, MOM_LONG = ret_net)
+
+# För Long/Short och Contrarian (fortsätt använda standardmotorn men var medveten om kostnaden)
+res_ls   <- run_strategy_engine(df_universe, 6, 1, "MOM_LS")
+# Vi exkluderar de allra minsta bolagen (< 50m EUR) för Contrarian för att minska risken för likvidations-bias
+res_cont <- run_strategy_engine(df_universe %>% filter(CUR_MKT_CAP > 50), 36, 12, "CONTRARIAN")
+
+# Slå ihop och hantera S&P 500
+strategy_results <- res_long %>%
+  left_join(res_ls, by = "date") %>%
+  left_join(res_cont, by = "date")
+
+if(!is.null(master_data$spx)) {
+  spx_rets <- master_data$spx %>%
+    mutate(date = lubridate::ceiling_date(as.Date(date), "month") - 1) %>%
+    arrange(date) %>%
+    mutate(SP500_EUR = PX_LAST / lag(PX_LAST) - 1) %>%
+    select(date, SP500_EUR) %>% drop_na()
+  strategy_results <- strategy_results %>% left_join(spx_rets, by = "date")
+}
+
+# Skapa xts_main (Vi behåller NA för Contrarian här för att inte korta ner serien)
+xts_main <- xts(strategy_results[,-1], order.by = strategy_results$date)
+
+if(exists("bench_omx")) {
+  xts_bench <- xts(bench_omx$OMXH25, order.by=bench_omx$date)
+  xts_main <- merge(xts_main, xts_bench)
+  colnames(xts_main)[ncol(xts_main)] <- "OMXH25"
+}
+
+mgrs_safe <- merge(xts_main, xts(rf_clean$RF_Monthly, order.by=rf_clean$date))
+colnames(mgrs_safe)[ncol(mgrs_safe)] <- "RF"
+# VIKTIGT: Vi gör INTE na.omit här än för att spara åren 2006-2009
+# ==============================================================================
+# SEKTION D: SCENARIER & TREND-FILTER (PRICE-ACTION LOGIC)
+# ==============================================================================
+message("🏃 Kör Sektion D: Trend-filter...")
+
+# 1. Hämta index-nivåer
+index_trend <- master_data$index %>%
+  mutate(date = to_last_day(date)) %>%
+  select(date, PX_LAST) %>%
+  arrange(date) %>%
+  mutate(
+    # SMA10 på priset (inte avkastningen)
+    SMA10 = zoo::rollmean(PX_LAST, k = 10, fill = NA, align = "right"),
+    # Signalen är TRUE om priset är över medelvärdet
+    # Vi laggar 1 månad för att simulera att vi agerar vid månadsskiftet
+    Trend_Signal = lag(PX_LAST > SMA10)
+  )
+
+trend_data <- index_trend %>% select(date, Trend_Signal) %>% drop_na()
+
+# 2. Kör grundstrategierna
+# 2. Kör grundstrategierna
+res_mom      <- run_strategy_engine(df_universe, 6, 1, "MOM_LS")
+res_con      <- run_strategy_engine(df_universe, 36, 12, "CONTRARIAN")
+res_mom_long <- run_strategy_engine(df_universe, 6, 1, "MOM_LONG")
+# NYTT: H1 The Battle of the Longs (Value vs Momentum)
+res_con_long <- run_strategy_engine(df_universe, 36, 12, "CONTRARIAN_LONG")
+# NYTT: Contrarian Improved (Reversal Filter)
+res_con_rev  <- run_strategy_engine(df_universe, 36, 12, "CONTRARIAN_REVERSAL")
+
+message("✅ Sektion D klar: Trend-filter baserat på Pris-SMA10.")
+# ==============================================================================
+# SEKTION E: HYPOTESPRÖVNING (SPECIFIKA ANOMALIER)
+# ==============================================================================
+message("\n🧪 --- STARTAR STATISTISK HYPOTESPRÖVNING (H1, H2, H3) ---")
+
+# 1. FÖRBERED DATA FÖR MODELLERING
+# Vi skapar en master-tabell och beräknar variabler för hypoteserna
+# Use explicit joins and ensure columns are unique
+res_long_clean <- res_mom_long %>% select(date, Mom_Long = MOM_LONG)
+res_con_clean  <- res_con_long %>% select(date, Con_Long = CONTRARIAN_LONG)
+res_rev_clean  <- res_con_rev  %>% select(date, Con_Rev  = CONTRARIAN_REVERSAL)
+
+amh_analysis_df <- res_mom %>%
+  rename(Mom_LS = MOM_LS) %>%
+  left_join(res_con %>% rename(Con_LS = CONTRARIAN), by = "date") %>%
+  left_join(res_long_clean, by="date") %>% 
+  left_join(res_con_clean, by="date") %>%
+  left_join(res_rev_clean, by="date") %>%
+  left_join(bench_omx, by = "date") %>% # Innehåller OMXH25
+  left_join(master_data$vix %>% mutate(date = to_last_day(date)) %>% 
+              select(date, v2x = PX_LAST) %>% distinct(date, .keep_all=TRUE), by = "date") %>%
+  arrange(date) %>%
+  mutate(
+    # Variabler för H1 (January Effect)
+    Month_Num = lubridate::month(date),
+    Is_Jan = if_else(Month_Num == 1, "Januari", "Övriga månader"),
+    
+    # Variabler för H2 (Bull/Bear Market)
+    Market_Regime = if_else(OMXH25 >= 0, "Bull Market", "Bear Market"),
+    
+    # Variabler för H3 (VIX Sensitivity)
+    # Procentuell förändring i V2X (Fear Gauge)
+    VIX_Change = v2x / lag(v2x) - 1
+  ) %>%
+  drop_na()
+
+# ------------------------------------------------------------------------------
+# H1: THE SEASONALITY OF VALUE (THE JANUARY EFFECT)
+# ------------------------------------------------------------------------------
+# Hypotes: Contrarian (Value) är egentligen en "Skatteeffekt". Den fungerar bara i januari.
+# Vi testar om avkastningen i januari är signifikant högre än resten av året.
+con_jan <- amh_analysis_df %>% filter(Is_Jan == "Januari") %>% pull(Con_Long)
+con_oth <- amh_analysis_df %>% filter(Is_Jan != "Januari") %>% pull(Con_Long)
+
+test_h1 <- t.test(con_jan, con_oth, alternative = "greater")
+
+message(sprintf("\n--- H1: The Seasonality of Value (January Effect) ---"))
+message(sprintf("January Return:       %.2f%%", mean(con_jan) * 100))
+message(sprintf("Rest of Year:         %.2f%%", mean(con_oth) * 100))
+message(sprintf("Signifikans (p):      %.4f %s", test_h1$p.value, 
+                ifelse(test_h1$p.value < 0.05, "✅ ENORM JANUARI-EFFEKT!", "❌ Ingen säsongseffekt")))
+
+# ------------------------------------------------------------------------------
+# EXTRA: MOMENTUM VS CONTRARIAN (JANUARY SHOWDOWN)
+# ------------------------------------------------------------------------------
+# Fråga: Vem vinner i januari? Momentum (Vinnare) eller Contrarian (Förlorare)?
+jan_mom_res <- amh_analysis_df %>% filter(Is_Jan == "Januari") %>% pull(Mom_Long)
+jan_con_res <- amh_analysis_df %>% filter(Is_Jan == "Januari") %>% pull(Con_Long)
+
+test_jan_battle <- t.test(jan_con_res, jan_mom_res, alternative = "greater", paired = TRUE)
+
+message(sprintf("\n--- EXTRA: January Showdown (Contrarian vs Momentum) ---"))
+message(sprintf("Contrarian (Jan):     %.2f%%", mean(jan_con_res) * 100))
+message(sprintf("Momentum (Jan):       %.2f%%", mean(jan_mom_res) * 100))
+message(sprintf("Signifikans (p):      %.4f %s", test_jan_battle$p.value, 
+                ifelse(test_jan_battle$p.value < 0.05, "✅ VALUE KROSSAR MOMENTUM!", "❌ Jämnt lopp")))
+
+# ------------------------------------------------------------------------------
+# H2: THE SUPREMACY OF MOMENTUM (FEB-DEC BULL MARKET)
+# --------------------------------0------------------------------
+# Hypotes: Under resten av året (när skatteeffekten är borta) och i Bull Trends,
+# så är Momentum signifikant bättre än Value.
+h2_data <- amh_analysis_df %>% 
+  filter(Is_Jan != "Januari") %>%       # Ignorera januari (Value-månaden)
+  left_join(trend_data, by="date") %>%
+  filter(Trend_Signal == TRUE) %>%      # Endast investerade månader (Bull Trend)
+  select(Mom_Long, Con_Long) %>%
+  drop_na()
+
+test_h2 <- t.test(h2_data$Mom_Long, h2_data$Con_Long, alternative = "greater", paired = TRUE)
+
+message(sprintf("\n--- H2: The Supremacy of Momentum (Feb-Dec Bull) ---"))
+message(sprintf("Momentum (Feb-Dec):   %.2f%%", mean(h2_data$Mom_Long) * 100))
+message(sprintf("Value (Feb-Dec):      %.2f%%", mean(h2_data$Con_Long) * 100))
+message(sprintf("Signifikans (p):      %.4f %s", test_h2$p.value, 
+                ifelse(test_h2$p.value < 0.05, "✅ BEVISAT: Momentum krossar Value (resten av året)!", "❌ Ej signifikant skillnad")))
+
+# ------------------------------------------------------------------------------
+# H3: THE PROTECTION OF TREND (CRISIS SHIELD)
+# ------------------------------------------------------------------------------
+# Hypotes: Trendfiltret (SMA10) räddar oss från Momentum-krascher.
+# Momentum-faktorn (Long/Short) kraschar ofta i Bear Markets.
+mom_trend_bull <- amh_analysis_df %>% 
+  left_join(trend_data, by="date") %>%
+  filter(Trend_Signal == TRUE) %>% pull(Mom_LS)
+
+mom_trend_bear <- amh_analysis_df %>% 
+  left_join(trend_data, by="date") %>%
+  filter(Trend_Signal == FALSE) %>% pull(Mom_LS)
+
+test_h3 <- t.test(mom_trend_bull, mom_trend_bear, alternative = "greater")
+
+message(sprintf("\n--- H3: The Protection of Trend (Crisis Shield) ---"))
+message(sprintf("Bull Trend Return:    %.2f%%", mean(mom_trend_bull, na.rm=TRUE) * 100))
+message(sprintf("Bear Trend Return:    %.2f%%", mean(mom_trend_bear, na.rm=TRUE) * 100))
+message(sprintf("Signifikans (p):      %.4f %s", test_h3$p.value, 
+                ifelse(test_h3$p.value < 0.05, "✅ BEVISAT: Trendfilter undviker krascher!", "❌ Ej signifikant")))
+
+
+message("\n✅ Sektion E klar.")
+
+# ==============================================================================
+# SEXIG GRAFIK FÖR PRESENTATION (JANUARY EFFECT)
+# ==============================================================================
+message("\n📊 --- SKAPAR GRAFIK FÖR PRESENTATION ---")
+
+# 1. Förbered data för plottning
+jan_effect_data <- amh_analysis_df %>%
+  mutate(Month_Label = factor(month(date, label = TRUE, abbr = TRUE), 
+                              levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))) %>%
+  group_by(Month_Label) %>%
+  summarise(
+    Avg_Return = mean(Con_Long, na.rm = TRUE),
+    Win_Rate   = sum(Con_Long > 0, na.rm = TRUE) / n()
+  ) %>%
+  mutate(
+    Highlight = if_else(Month_Label == "Jan", "Yes", "No") # För att färga Januari annorlunda
+  )
+
+# 2. Skapa Bar Chart med ggplot2
+jan_plot <- ggplot(jan_effect_data, aes(x = Month_Label, y = Avg_Return, fill = Highlight)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c("Yes" = "#2ecc71", "No" = "#34495e")) + # Grön för Jan, Mörkblå för övriga
+  labs(
+    title = "The January Effect: Contrarian Strategy (2006-2026)",
+    subtitle = "Average Monthly Return for 'Loser' Portfolio (Long Only)",
+    x = "Month",
+    y = "Average Return",
+    caption = "Data: Bloomberg | Market: OMX Helsinki All-Share"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text = element_text(size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+# 3. Visa plotten OCH SPARA SOM PDF
+print(jan_plot)
+ggsave("January_Effect.pdf", plot = jan_plot, width = 8, height = 6)
+message("✅ Graf skapad och sparad som 'January_Effect.pdf'.")
+
+
+# ==============================================================================
+# SEKTION F: QUANT OVERLAY (SHARPE & RETURN OPTIMIZATION)
+# ==============================================================================
+message("\n🧠 --- APPLICERAR QUANT-OPTIMERINGAR ---")
+
+# FIX: Lägg till Con_Long till safety-objektet för Thesis Strategy
+# Notera: Vi använder 'CONTRARIAN_LONG' från res_con_long som vi beräknade i Sektion D/E
+if(exists("res_con_long")) {
+  # Konvertera till xts för att matcha datumindex (MOM startar tidigare än CONTRARIAN)
+  xts_con <- xts(res_con_long$CONTRARIAN_LONG, order.by = res_con_long$date)
+  # Merge med safe-objektet (hanterar olika längder automatiskt)
+  mgrs_safe <- merge(mgrs_safe, Con_Long = xts_con)
+} else {
+  warning("⚠️ res_con_long saknas! Thesis Strategy kanske inte fungerar.")
+}
+
+TARGET_VOL   <- 0.12  # 12% Vol-mål
+MAX_LEVERAGE <- 1   # Ökat tak för att fånga mer momentum i lugna marknader
+
+final_overlay <- as.data.frame(mgrs_safe) %>% 
+  mutate(date = index(mgrs_safe)) %>%
+  # Fill NA values implies 0 return (or carry over?) -> 0 is safer for uncalculated periods
+  mutate(Con_Long = replace_na(Con_Long, 0)) %>%
+  select(-matches("Trend_Signal"), -matches("MOM_LONG_Combo")) %>%
+  left_join(trend_data, by="date") %>%
+  mutate(
+    # Rullande 6m Volatilitet
+    Roll_Vol = zoo::rollapply(MOM_LONG, width=6, FUN=sd, fill=NA, align="right") * sqrt(12),
+    
+    # Skalningsfaktor (Risk-parity approach)
+    Vol_Scaler = pmin(TARGET_VOL / Roll_Vol, MAX_LEVERAGE),
+    Vol_Scaler = replace_na(Vol_Scaler, 1.0),
+    
+    # Prestanda-logik: Om Trend = POSITIV -> Kör Momentum. Om Trend = NEGATIV -> Cash (RF).
+    MOM_LONG_Trend = if_else(replace_na(Trend_Signal, TRUE), MOM_LONG, RF),
+    
+    # Combo: Skalad exponering + ränta på resterande kapital
+    Combo_Ret = (MOM_LONG_Trend * Vol_Scaler) + (RF * (1 - Vol_Scaler))
+  )
+
+# Injicera den optimerade avkastningen
+mgrs_safe$MOM_LONG_Combo <- xts(final_overlay$Combo_Ret, order.by=final_overlay$date)
+
+message("✅ Sektion F klar: MOM_LONG_Combo återställd till högpresterande logik.")
+
+# ==============================================================================
+# SEKTION F.2: THE THESIS FINAL STRATEGY (MASTER COMBO)
+# ==============================================================================
+message("\n🏆 --- SKAPAR 'THE THESIS STRATEGY' (Seasonal + Trend) ---")
+
+thesis_overlay <- final_overlay %>%
+  mutate(
+    Month = month(date),
+    # Strategy Logic:
+    # 1. January: Contrarian Long (Rebound Effect) - We apply a 2.0% LIQUIDITY PENALTY (Stress Test)
+    #    Simulating high spread/slippage for "Loser" stocks.
+    # 2. Feb-Dec: Momentum Long (Trend Filtered) - Already net of standard 0.25% cost.
+    
+    Thesis_Raw = if_else(Month == 1, 
+                         coalesce(Con_Long, 0) - 0.02,  # Jan: Value - 2.0% Cost
+                         coalesce(MOM_LONG_Trend, RF)   # Feb-Dec: Mom (Filtered)
+    )
+  )
+
+# Add to Main XTS
+mgrs_safe$Thesis_Strategy <- xts(thesis_overlay$Thesis_Raw, order.by=thesis_overlay$date)
+
+# Beräkna & Rapportera Sharpe
+thesis_shrp <- SharpeRatio.annualized(mgrs_safe$Thesis_Strategy, Rf=0, scale=12)
+message(sprintf("Thesis Strategy Sharpe (Stress Tested): %.2f", thesis_shrp))
+
+# ==============================================================================
+# UPPDATERAD SEKTION G: OPTIMERING MED NYA SÄLJ-REGLER (BUFFER)
+# ==============================================================================
+message("\n🚀 --- KÖR SEKTION G: OPTIMERING MED BUFFER-LOGIK ---")
+
+# 1. PORTFOLIO SIZE SENSITIVITY (MED BUFFER)
+message("📊 Del 1: Känslighetsanalys för portföljstorlek...")
+sizes <- seq(10, 30, by = 5)
+size_res <- data.frame()
+
+for(n in sizes) {
+  # Vi följer den nya regeln: n_sell = n_buy + 5
+  tmp_port <- run_buffered_engine(df_universe, n_buy = n, n_sell = n + 5, cost_pct = TRANS_COST)
+  xts_tmp <- xts(tmp_port$ret_net, order.by=tmp_port$date)
+  shrp <- SharpeRatio.annualized(xts_tmp, Rf=0)
+  size_res <- rbind(size_res, data.frame(Size=n, Sharpe=as.numeric(shrp)))
+}
+print(size_res)
+
+# 2. GRID SEARCH: FORMATION VS HOLDING -- (COMMENTED OUT: REDUNDANT, DONE IN VISUALIZATION MODULE)
+# message("🔥 Del 2: Grid Search (Formation vs Holding) - Net of Costs with Buffer...")
+# f_vec <- c(3, 6, 9, 12); h_vec <- c(1, 3, 6, 12)
+# grid_mom <- expand.grid(Formation = f_vec, Holding = h_vec)
+# grid_mom$Sharpe <- NA
+# 
+# for(i in 1:nrow(grid_mom)) {
+#   try({
+#     # Här använder vi den nya regeln: Köp 20, Sälj 25 (Buffer +5)
+#     # Detta gör att transaktionskostnaderna inte förstör resultatet
+#     tmp <- run_buffered_engine(df_universe, 
+#                                n_buy = 20, 
+#                                n_sell = 25, 
+#                                form = grid_mom$Formation[i], 
+#                                hold = grid_mom$Holding[i],
+#                                cost_pct = TRANS_COST)
+#     
+#     xts_tmp <- xts(tmp$ret_net, order.by = tmp$date)
+#     grid_mom$Sharpe[i] <- as.numeric(SharpeRatio.annualized(xts_tmp, Rf = 0))
+#   }, silent = TRUE)
+# }
+# 
+# # Uppdaterad visualisering av Quant 2
+# p2_updated <- ggplot(grid_mom, aes(x = factor(Holding), y = factor(Formation), fill = Sharpe)) +
+#   geom_tile() + scale_fill_gradient(low = "white", high = "#E67E22") +
+#   geom_text(aes(label = round(Sharpe, 2))) +
+#   labs(title = "Quant 2: Momentum Optimization Heatmap",
+#        subtitle = "Net Sharpe using 'New Rules' (Buffer: Buy 20 / Sell 25)",
+#        x = "Holding Period (Months)", y = "Formation Period (Months)") +
+#   theme_minimal()
+# 
+# ggsave("Quant_2_Heatmap.pdf", p2_updated, width = 8, height = 6)
+
+# 3. BUFFER OPTIMIZATION (VERIFIERAR REGELN)
+message("💎 Del 3: Buffer Optimization (Verifiering av sälj-tröskel)...")
+buy_vals <- c(10, 15, 20)
+buff_vals <- c(0, 5, 10, 15)
+
+results_buff <- expand.grid(Buy = buy_vals, Buffer = buff_vals)
+results_buff$Sharpe <- NA
+
+for(i in 1:nrow(results_buff)) {
+  n_b <- results_buff$Buy[i]
+  n_s <- n_b + results_buff$Buffer[i]
+  
+  tmp_buf <- run_buffered_engine(df_universe, n_buy = n_b, n_sell = n_s, cost_pct = TRANS_COST)
+  xts_buf <- xts(tmp_buf$ret_net, order.by = tmp_buf$date)
+  results_buff$Sharpe[i] <- as.numeric(SharpeRatio.annualized(xts_buf, Rf = 0))
+}
+
+p_buff <- ggplot(results_buff, aes(x=factor(Buffer), y=factor(Buy), fill=Sharpe)) +
+  geom_tile() + scale_fill_gradient(low="white", high="#27AE60") +
+  geom_text(aes(label=round(Sharpe, 2)), color="black") +
+  labs(title="Quant 6: Buffer Optimization Heatmap",
+       subtitle="How 'New Sell Rules' affect Net Sharpe",
+       x="Buffer (Extra positions before selling)", y="Buy Amount (Top N)") +
+  theme_minimal()
+
+ggsave("Quant_6_Buffer_Heatmap.pdf", p_buff, width=8, height=6)
+
+# 4. TURNOVER REPORT
+message("📈 Del 4: Genererar Turnover-rapport...")
+final_sim <- run_buffered_engine(df_universe, n_buy = 20, n_sell = 25, cost_pct = TRANS_COST)
+p_turn <- ggplot(final_sim, aes(x=date, y=turnover)) +
+  geom_bar(stat="identity", fill="#3498DB") +
+  theme_minimal() +
+  labs(title="Quant 7: Monthly Portfolio Turnover", 
+       subtitle="Realized turnover with Buy 20 / Sell 25 rules",
+       y="Omsättningsgrad", x="År")
+ggsave("Quant_7_Turnover.pdf", p_turn, width=8, height=5)
+
+message("✅ Sektion G och heatmap-filer är nu uppdaterade enligt nya regler.")
+# ==============================================================================
+# NY MODUL: VISUALISERINGAR (QUANT 1, 2 & 3)
+# ==============================================================================
+message("\n🎨 --- GENERERAR GRAFIK FÖR THESIS (QUANT 1, 2, 3) ---")
+
+# --- QUANT 1: TREND FILTER ROBUSTNESS (MA SENSITIVITY) ---
+message("📈 Genererar Quant_1: MA Sensitivity...")
+ma_range <- seq(8, 20, by = 2)
+ma_results <- data.frame()
+
+for(ma in ma_range) {
+  # Temporär beräkning av Trend-filter med olika längder
+  temp_index <- master_data$index %>%
+    mutate(date = to_last_day(date)) %>%
+    arrange(date) %>%
+    mutate(SMA = zoo::rollmean(PX_LAST, k = ma, fill = NA, align = "right"),
+           Signal = lag(PX_LAST > SMA))
+  
+  temp_combo <- as.data.frame(mgrs_safe) %>% 
+    mutate(date = index(mgrs_safe)) %>%
+    left_join(temp_index %>% select(date, Signal), by="date") %>%
+    mutate(Ret = if_else(replace_na(Signal, TRUE), MOM_LONG, RF))
+  
+  shrp <- SharpeRatio.annualized(xts(temp_combo$Ret, order.by=temp_combo$date), Rf=0)
+  ma_results <- rbind(ma_results, data.frame(MA = ma, Sharpe = as.numeric(shrp)))
+}
+
+p1 <- ggplot(ma_results, aes(x = MA, y = Sharpe)) +
+  geom_line(color = "#2980B9", size = 1) + geom_point(size = 3) +
+  theme_minimal() + labs(title = "Quant 1: Trend Filter Robustness",
+                         subtitle = "Sharpe Ratio across different SMA lengths",
+                         y = "Annualized Sharpe", x = "Moving Average Length (Months)")
+ggsave("Quant_1_MA_Sensitivity.pdf", p1, width = 8, height = 5)
+
+
+# --- QUANT 2: MOMENTUM OPTIMIZATION HEATMAP ---
+message("🔥 Genererar Quant_2: Momentum Heatmap...")
+# Vi använder net_ret för att vara realistiska
+f_vec <- c(3, 6, 9, 12); h_vec <- c(1, 3, 6, 12)
+grid_mom <- expand.grid(Formation = f_vec, Holding = h_vec)
+grid_mom$Sharpe <- NA
+
+for(i in 1:nrow(grid_mom)) {
+  try({
+    # Vi använder standardmotorn här för att snabbt scanna parametrar
+    tmp <- run_strategy_engine(df_universe, grid_mom$Formation[i], grid_mom$Holding[i], "MOM_LONG")
+    grid_mom$Sharpe[i] <- as.numeric(SharpeRatio.annualized(xts(tmp$MOM_LONG, order.by=tmp$date), Rf=0))
+  }, silent=TRUE)
+}
+
+p2 <- ggplot(grid_mom, aes(x = factor(Holding), y = factor(Formation), fill = Sharpe)) +
+  geom_tile() + scale_fill_gradient(low = "white", high = "#E67E22") +
+  geom_text(aes(label = round(Sharpe, 2))) +
+  labs(title = "Quant 2: Momentum Optimization Heatmap",
+       x = "Holding Period (Months)", y = "Formation Period (Months)") +
+  theme_minimal()
+ggsave("Quant_2_Heatmap.pdf", p2, width = 8, height = 6)
+
+
+# --- QUANT 3: SEASONALITY CHECK (MOM_LONG_COMBO) ---
+message("📅 Genererar Quant_3: Seasonality...")
+# Vi kollar om strategin presterar olika bra i olika månader (t.ex. Januari-effekten)
+season_data <- data.frame(
+  Return = as.numeric(mgrs_safe$MOM_LONG_Combo),
+  Month = month(index(mgrs_safe), label = TRUE, abbr = TRUE)
+) %>% group_by(Month) %>% summarise(Avg_Return = mean(Return, na.rm = TRUE))
+
+p3 <- ggplot(season_data, aes(x = Month, y = Avg_Return, fill = Avg_Return > 0)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("#C0392B", "#27AE60"), guide = "none") +
+  theme_minimal() + labs(title = "Quant 3: Seasonality Check (MOM_LONG_Combo)",
+                         subtitle = "Average Monthly Returns", y = "Average Return", x = "")
+ggsave("Quant_3_Seasonality.pdf", p3, width = 9, height = 5)
+
+message("✅ Alla Thesis-grafer (Quant 1-3) är nu genererade.")
+# ==============================================================================
+# SEKTION H: ROLLING SHARPE VIA GGPLOT2 (STABIL VERSION)
+# ==============================================================================
+message("\n📊 --- KÖR SEKTION H: DYNAMISK RISK-FREE ANALYS (GGPLOT VERSION) ---")
+
+# 1. Rensa alla gamla grafik-enheter
+while (dev.cur() > 1) dev.off()
+
+# 2. Förbered data (Excess Returns)
+target_cols <- c("MOM_LONG_Combo", "MOM_LONG", "MOM_LS", "CONTRARIAN", "OMXH25", "SP500_EUR")
+available_cols <- intersect(target_cols, colnames(mgrs_safe))
+
+# Skapa en data frame för beräkning
+df_excess <- as.data.frame(mgrs_safe[, c(available_cols, "RF")])
+df_excess$date <- index(mgrs_safe)
+
+# Beräkna rullande Sharpe (36 månader) manuellt
+# Formel: (Medelavkastning * 12) / (Standardavvikelse * sqrt(12))
+library(zoo)
+
+rolling_sharpe_list <- list()
+
+for(col in available_cols) {
+  excess_ret <- df_excess[[col]] - df_excess$RF
+  
+  roll_mean <- rollapply(excess_ret, width = 36, FUN = mean, fill = NA, align = "right")
+  roll_sd <- rollapply(excess_ret, width = 36, FUN = sd, fill = NA, align = "right")
+  
+  # Annualisera
+  roll_sharpe <- (roll_mean * 12) / (roll_sd * sqrt(12))
+  
+  rolling_sharpe_list[[col]] <- data.frame(
+    date = df_excess$date,
+    Strategy = col,
+    Sharpe = roll_sharpe
+  )
+}
+
+plot_df <- bind_rows(rolling_sharpe_list) %>% drop_na(Sharpe)
+
+# 3. Skapa grafen med ggplot2
+message("📈 Skapar Quant_5_Rolling_Sharpe.pdf via ggplot2...")
+
+p_roll <- ggplot(plot_df, aes(x = date, y = Sharpe, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c(
+    "MOM_LONG_Combo" = "#27AE60", 
+    "MOM_LONG" = "#E67E22", 
+    "MOM_LS" = "#2980B9", 
+    "CONTRARIAN" = "#8E44AD", 
+    "OMXH25" = "#7F8C8D", 
+    "SP500_EUR" = "#D81B60"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Rolling 36-Month Sharpe Ratio (Dynamic Rf)",
+    subtitle = "Manual calculation for improved file stability",
+    y = "Annualized Sharpe Ratio",
+    x = ""
+  ) +
+  theme(legend.position = "bottom")
+
+# 4. SPARA VIA GGSAVE (Detta är mycket säkrare än pdf() + dev.off())
+ggsave("Quant_5_Rolling_Sharpe.pdf", p_roll, width = 11, height = 7, device = "pdf")
+
+message("✅ Quant_5_Rolling_Sharpe.pdf sparad framgångsrikt via ggsave.")
+
+# 5. PRESTANDATABELL (Behåll som tidigare)
+message("\n🏆 --- FINAL PERFORMANCE METRICS ---")
+mgrs_excess_xts <- as.xts(df_excess[, available_cols] - df_excess$RF, order.by = df_excess$date)
+print(table.AnnualizedReturns(mgrs_excess_xts, Rf = 0, scale = 12))
+# ==============================================================================
+# SEKTION J: CONTRARIAN OPTIMIZATION (LONG-TERM HEATMAP)
+# ==============================================================================
+message("\n🐢 --- KÖR CONTRARIAN OPTIMERING (LONG TERM) ---")
+
+library(ggplot2); library(reshape2); library(PerformanceAnalytics)
+
+# VI ÄNDRAR TIDSRAMEN FÖR ATT PASSA CONTRARIAN
+# Vi testar 24, 36, 48, 60 månader (2-5 år)
+f_vec_con <- c(24, 36, 48, 60)
+h_vec_con <- c(12, 24, 36, 48)
+
+grid_con <- matrix(NA, nrow=length(f_vec_con), ncol=length(h_vec_con))
+rownames(grid_con) <- paste0("Form_", f_vec_con)
+colnames(grid_con) <- paste0("Hold_", h_vec_con)
+
+for(i in 1:length(f_vec_con)) {
+  for(j in 1:length(h_vec_con)) {
+    try({
+      # NOTERA: strategy_mode = "CONTRARIAN"
+      tmp <- run_strategy_engine(df_universe, form_months=f_vec_con[i], hold_months=h_vec_con[j], strategy_mode="CONTRARIAN")
+      xts_tmp <- xts(tmp$CONTRARIAN, order.by=tmp$date)
+      grid_con[i,j] <- round(SharpeRatio.annualized(xts_tmp, Rf=0, scale=12), 2)
+    }, silent=TRUE)
+  }
+}
+
+# VISUALISERA
+melt_con <- melt(grid_con)
+colnames(melt_con) <- c("Formation", "Holding", "Sharpe")
+
+p_heat_con <- ggplot(melt_con, aes(x=factor(Holding), y=factor(Formation), fill=Sharpe)) +
+  geom_tile() +
+  scale_fill_gradient2(low="#C0392B", mid="white", high="#27AE60", midpoint=0) +
+  geom_text(aes(label=Sharpe), color="black") +
+  labs(title="Contrarian Optimization (Long-Term)", 
+       subtitle="Testing Multi-Year Horizons (Reversal Effect)",
+       x="Holding Period (Months)", y="Formation Period (Months)") +
+  theme_minimal()
+
+ggsave("Quant_4_Contrarian_Heatmap.pdf", p_heat_con, width=8, height=6)
+message("✅ Contrarian Heatmap sparad som 'Quant_4_Contrarian_Heatmap.pdf'")
+
+# ==============================================================================
+# SEKTION K: PORTFOLIO MANAGEMENT METRICS (DYNAMIC RF)
+# ==============================================================================
+message("\n💎 --- KÖR SEKTION K: DYNAMISK RISKANALYS ---")
+
+calculate_realized_sharpe <- function(R_p, R_f) {
+  excess_returns <- na.omit(R_p - R_f)
+  if(length(excess_returns) < 12) return(NULL)
+  
+  # Annualiserad Sharpe baserad på faktiska månatliga spreads
+  ann_return = mean(excess_returns) * 12
+  ann_stddev = sd(excess_returns) * sqrt(12)
+  sharpe = ann_return / ann_stddev
+  
+  return(data.frame(
+    Realized_Ann_Excess = ann_return,
+    Realized_Ann_Vol = ann_stddev,
+    Realized_Sharpe = sharpe,
+    Max_Drawdown = maxDrawdown(excess_returns)
+  ))
+}
+
+risk_list <- list()
+for(s in available_cols) {
+  risk_list[[s]] <- calculate_realized_sharpe(mgrs_safe[, s], mgrs_safe$RF)
+}
+
+if(length(risk_list) > 0) {
+  final_risk_report <- do.call(rbind, risk_list)
+  print(round(final_risk_report, 4))
+}
+# ==============================================================================
+# SEKTION L: SUB-PERIOD ANALYSIS
+# ==============================================================================
+message("\n⏳ --- ANALYSERAR SUB-PERIODER ---")
+
+analyze_period <- function(xts_obj, start_p, end_p, label) {
+  sub_data <- xts_obj[paste0(start_p, "/", end_p)]
+  res <- table.AnnualizedReturns(sub_data, scale=12)
+  message(paste("\n--- Period:", label, "(", start_p, "till", end_p, ") ---"))
+  print(res)
+}
+
+# 1. Finanskris & Återhämtning (2007-2012)
+try(analyze_period(mgrs_safe[, available_cols], "2007-01-01", "2012-12-31", "Crisis & Recovery"))
+
+# 2. Lågränteeran & Tech-rally (2013-2020)
+try(analyze_period(mgrs_safe[, available_cols], "2013-01-01", "2020-12-31", "Low Rate Era"))
+
+# 3. Post-Pandemi & Inflation (2021-2026)
+try(analyze_period(mgrs_safe[, available_cols], "2021-01-01", "2026-02-02", "High Inflation Era"))
+
+# ==============================================================================
+# SEKTION H: SAMMANSTÄLLNING AV RESULTAT (TABELLER)
+# ==============================================================================
+message("\n📝 --- SAMMANSTÄLLER SLUTRESULTAT ---")
+
+# Välj ut de viktigaste strategierna för rapporten
+# Notera: plot_cols definieras i nästa sektion, men vi behöver dem här.
+cols_for_table <- intersect(c("Thesis_Strategy", "MOM_LONG_Combo", "MOM_LONG", "MOM_LS", "CONTRARIAN", "OMXH25", "SP500_EUR"), 
+                       colnames(mgrs_safe))
+
+# Skapa tabell med Sharpe, Avkastning, Volatilitet
+final_metrics <- table.AnnualizedReturns(mgrs_safe[, cols_for_table], Rf = 0, scale = 12)
+print(final_metrics)
+
+# Drawdowns
+final_drawdowns <- table.Drawdowns(mgrs_safe[, cols_for_table], top = 1)
+print(final_drawdowns)
+
+# ==============================================================================
+# MODUL: FINAL PERFORMANCE GRAPH (ALL STRATEGIES & BENCHMARKS)
+# ==============================================================================
+message("\n🎨 --- GENERERAR UPPDATERAD MASTER-GRAF (Inkl. Thesis Strategy) ---")
+
+# 1. VÄLJ UT ALLA RELEVANTA SERIER
+# Vi inkluderar nu Thesis_Strategy (Vår "Final Answer")
+plot_cols <- intersect(c("Thesis_Strategy", "MOM_LONG_Combo", "MOM_LONG", "MOM_LS", "CONTRARIAN", "OMXH25", "SP500_EUR"), 
+                       colnames(mgrs_safe))
+
+# Skapa kopia och städa upp namnen för legenden
+plot_data <- mgrs_safe[, plot_cols]
+colnames(plot_data) <- gsub("_", " ", colnames(plot_data))
+
+# 2. EXPANDERAT FÄRGSCHEMA (7 FÄRGER)
+# Thesis = Guld/Gul (Hero), Combo = Grön, Long = Orange, LS = Blå, Contrarian = Lila, OMXH25 = Grå, SP500 = Rosa
+strategy_colors <- c("#F1C40F", "#27AE60", "#E67E22", "#2980B9", "#8E44AD", "#7F8C8D", "#D81B60")
+
+# 3. SKAPA PDF-FILEN
+pdf("Thesis_FINAL_Graph.pdf", width = 11, height = 8.5)
+
+# Vi använder charts.PerformanceSummary för den kompletta akademiska vyn
+charts.PerformanceSummary(
+  plot_data,
+  main = "Thesis Final Strategy: Seasonal Momentum & Trend Filter vs Benchmarks",
+  sub = paste("Period:", start(plot_data), "to", end(plot_data)),
+  methods = c("ModifiedVaR"), 
+  colorset = strategy_colors,
+  lwd = 1.8,                  # Något tunnare linjer för att hantera fler serier
+  cex.legend = 0.9,           # Mindre legend-text för att rymma alla sex namn
+  legend.loc = "topleft",
+  ylog = TRUE,                # Logaritmisk skala för rättvis jämförelse av tillväxt
+  wealth.index = TRUE,        # Starta alla på 1 (100%)
+  gap = 2                     # Avstånd mellan de tre panelerna
+)
+
+dev.off()
+
+message("✅ Master-graf med samtliga strategier sparad ")
+
+# ==============================================================================
+# SEKTION M: OUT-OF-SAMPLE VALIDATION FOR THESIS STRATEGY
+# ==============================================================================
+message("\n🧪 --- KÖR SEKTION M: THESIS OUT-OF-SAMPLE TEST ---")
+
+# 1. DEFINIERA PERIODER
+split_date <- as.Date("2015-12-31")
+
+# 2. MATCHNING AV VETENSKAPLIG LAYOUT (Top: Wealth, Bottom: Stability)
+message("🔍 In-Sample Optimering & OOS Validering...")
+
+# DATA PREP: Hämta rådata
+is_dates <- index(mgrs_safe)[index(mgrs_safe) <= split_date]
+oos_dates <- index(mgrs_safe)[index(mgrs_safe) > split_date]
+
+is_all <- mgrs_safe[is_dates]
+oos_all <- mgrs_safe[oos_dates]
+
+# Hitta Optimal SMA (In-Sample)
+ma_test_range <- seq(6, 18, by = 2)
+is_results <- data.frame()
+
+for(ma in ma_test_range) {
+  # SMA Calculation (In-Sample Only, but using trailing data)
+  full_index_sma <- master_data$index %>%
+    mutate(SMA = zoo::rollmean(PX_LAST, k = ma, fill = NA, align = "right"),
+           Signal = lag(PX_LAST > SMA))
+  
+  sig_vector <- full_index_sma %>% filter(date %in% is_dates) %>% select(date, Signal) %>%
+    right_join(data.frame(date=is_dates), by="date") %>% pull(Signal) %>% replace_na(TRUE)
+
+  ret_vec <- if_else(month(is_dates) == 1,
+                     coalesce(coredata(is_all$Con_Long), 0) - 0.02,
+                     if_else(sig_vector, coalesce(coredata(is_all$MOM_LONG), 0), coredata(is_all$RF)))
+  
+  shrp <- SharpeRatio.annualized(xts(ret_vec, order.by=is_dates), Rf=0)
+  is_results <- rbind(is_results, data.frame(MA = ma, Sharpe = as.numeric(shrp)))
+}
+
+best_ma <- is_results$MA[which.max(is_results$Sharpe)]
+is_sharpe_val <- max(is_results$Sharpe)
+message(sprintf("✅ In-Sample Optimal SMA: %d (Sharpe: %.2f)", best_ma, is_sharpe_val))
+
+
+# 3. KÖR STRATEGIN FÖR HELA PERIODEN (MED OPTIMAL SMA)
+# Vi bygger en samlad serie för plotting
+full_index_opt <- master_data$index %>%
+  mutate(SMA = zoo::rollmean(PX_LAST, k = best_ma, fill = NA, align = "right"),
+         Signal = lag(PX_LAST > SMA))
+
+sig_full <- full_index_opt %>% filter(date %in% index(mgrs_safe)) %>% select(date, Signal) %>%
+  right_join(data.frame(date=index(mgrs_safe)), by="date") %>% pull(Signal) %>% replace_na(TRUE)
+
+ret_full <- if_else(month(index(mgrs_safe)) == 1,
+                    coalesce(coredata(mgrs_safe$Con_Long), 0) - 0.02,
+                    if_else(sig_full, coalesce(coredata(mgrs_safe$MOM_LONG), 0), coredata(mgrs_safe$RF)))
+
+# 4. SKAPA DATAFRAMES FÖR GGPLOT
+# Cumulative Return
+# Ensure vectors are simple numeric to avoid data.frame weirdness
+strategy_vec <- as.numeric(ret_full)
+index_vec    <- as.numeric(coredata(mgrs_safe$OMXH25))
+
+df_wealth <- data.frame(date = index(mgrs_safe), Strategy = strategy_vec, Index = index_vec) %>%
+  mutate(
+    Strategy_Wealth = cumprod(1 + replace_na(Strategy, 0)),
+    Index_Wealth    = cumprod(1 + replace_na(Index, 0)),
+    Period          = if_else(date <= split_date, "In-Sample", "Out-of-Sample")
+  ) %>%
+  pivot_longer(cols = c("Strategy_Wealth", "Index_Wealth"), names_to = "Type", values_to = "Wealth")
+
+# Calculate OOS Sharpe
+oos_ret <- ret_full[index(mgrs_safe) > split_date]
+oos_sharpe_val <- SharpeRatio.annualized(xts(oos_ret, order.by=oos_dates), Rf=0)
+
+# Bar Chart Data
+df_risk <- data.frame(
+  Period = c(paste0("In-Sample (2006-", year(split_date), ")"), 
+             paste0("Out-of-Sample (", year(split_date)+1, "-2026)")),
+  Sharpe = c(as.numeric(is_sharpe_val), as.numeric(oos_sharpe_val)),
+  Color  = c("Grey", "Green")
+)
+
+# 5. GENERERA GRAFIK
+# Top: Cumulative Wealth
+p_top <- ggplot(df_wealth, aes(x = date, y = Wealth, color = Type)) +
+  geom_line(size = 1) +
+  geom_vline(xintercept = as.numeric(split_date), linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = as.Date("2011-01-01"), y = max(df_wealth$Wealth)*0.9, label = "TRAINING (In-Sample)", slope=0, fontface="italic") +
+  annotate("text", x = as.Date("2020-01-01"), y = max(df_wealth$Wealth)*0.9, label = "VALIDATION (Out-of-Sample)", slope=0, fontface="italic") +
+  labs(title = "Out-of-Sample Validation: Strategy Robustness",
+       subtitle = paste("Optimized SMA length:", best_ma),
+       y = "Cumulative Wealth (Start = 1.0)", x = "") +
+  scale_color_manual(values = c("Index_Wealth" = "#95a5a6", "Strategy_Wealth" = "#27ae60"), 
+                     labels = c("Index", "Strategy")) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+# Bottom: Sharpe Stability
+p_bottom <- ggplot(df_risk, aes(x = Period, y = Sharpe, fill = Period)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = round(Sharpe, 2)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("#bdc3c7", "#2ecc71")) + # Grey vs Green
+  labs(title = "Stability of Risk-Adjusted Returns", x = "", y = "Annualized Sharpe") +
+  ylim(0, max(df_risk$Sharpe) * 1.2) +
+  theme_minimal() +
+  theme(legend.position = "none", panel.grid.major.x = element_blank())
+
+# Combine and Save
+pdf("Thesis_OOS_Validation.pdf", width = 10, height = 8) # Något högre för 2 paneler
+grid.arrange(p_top, p_bottom, nrow = 2, heights = c(2, 1))
+dev.off()
+
+message("✅ OOS-layout uppdaterad enligt önskemål. Sparad som 'Thesis_OOS_Validation.pdf'")
+
+# Print a Clean Table to Console too
+print(df_risk)
+
+# Spara OOS-graf
+pdf("Quant_8_Out_Of_Sample.pdf", width=8, height=6)
+charts.PerformanceSummary(merge(xts_oos, xts_bench_oos), 
+                          main=paste("Out-of-Sample Validation (SMA =", best_ma, ")"),
+                          colorset=c("#27AE60", "#7F8C8D"))
+dev.off()
+
+# ==============================================================================
+# MODUL: OOS PRESENTATION DASHBOARD (QUANT_9)
+# ==============================================================================
+message("\n📊 --- SKAPAR PRESENTATIONSGRAF FÖR OOS ---")
+
+library(gridExtra)
+
+# 1. Förbered data för kumulativ graf (Hela perioden)
+# Vi kombinerar IS-avkastning och OOS-avkastning till en serie
+full_strat_ret <- c(test_is$Ret, final_oos$Ret)
+full_dates <- c(test_is$date, final_oos$date)
+xts_full_strat <- xts(full_strat_ret, order.by = full_dates)
+xts_full_bench <- xts(bench_omx$OMXH25, order.by = bench_omx$date)
+
+# Beräkna rikedom (Wealth Index)
+wealth_df <- data.frame(
+  Date = index(xts_full_strat),
+  Strategy = cumprod(1 + as.numeric(xts_full_strat)),
+  Index = cumprod(1 + as.numeric(xts_full_bench[index(xts_full_strat)]))
+) %>% pivot_longer(-Date, names_to = "Type", values_to = "Wealth")
+
+# 2. Skapa den kumulativa grafen med annoteringar
+p_wealth <- ggplot(wealth_df, aes(x = Date, y = Wealth, color = Type)) +
+  geom_line(size = 1) +
+  geom_vline(xintercept = as.numeric(split_date), linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = as.Date("2010-01-01"), y = max(wealth_df$Wealth)*0.9, 
+           label = "TRAINING (In-Sample)", color = "black", fontface = "italic") +
+  annotate("text", x = as.Date("2020-01-01"), y = max(wealth_df$Wealth)*0.9, 
+           label = "VALIDATION (Out-of-Sample)", color = "black", fontface = "italic") +
+  scale_color_manual(values = c("#7F8C8D", "#27AE60")) +
+  theme_minimal() +
+  labs(title = "Out-of-Sample Validation: Strategy Robustness",
+       subtitle = paste("Optimized SMA length:", best_ma),
+       y = "Cumulative Wealth (Start = 1.0)", x = "") +
+  theme(legend.position = "bottom")
+
+# 3. Skapa en Bar-chart som jämför IS vs OOS Sharpe (Stabilitets-bevis)
+sharpe_comparison <- data.frame(
+  Period = c("In-Sample (2006-2015)", "Out-of-Sample (2016-2026)"),
+  Sharpe = c(max(is_results$Sharpe), as.numeric(oos_stats[3, 1]))
+)
+
+p_bar <- ggplot(sharpe_comparison, aes(x = Period, y = Sharpe, fill = Period)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_text(aes(label = round(Sharpe, 2)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("#BDC3C7", "#2ECC71")) +
+  theme_minimal() +
+  labs(title = "Stability of Risk-Adjusted Returns", y = "Annualized Sharpe", x = "") +
+  theme(legend.position = "none")
+
+# 4. Spara kombinerad dashboard
+pdf("Quant_9_OOS_Presentation.pdf", width = 12, height = 8)
+grid.arrange(p_wealth, p_bar, ncol = 1, heights = c(2, 1))
+dev.off()
+
+# ==============================================================================
+# SEKTION N: SLIPPAGE STRESS TEST (REFINED VERSION)
+# ==============================================================================
+message("\n🧪 --- KÖR SEKTION N: SLIPPAGE STRESS TEST ---")
+
+# 1. DEFINIERA TEST-OMRÅDE
+# Från 0.1% (institutionell) till 1.0% (extremt höga kostnader/slippage)
+cost_scenarios <- seq(0.001, 0.010, by = 0.001)
+stress_results <- data.frame()
+
+for(c in cost_scenarios) {
+  # Kör motorn med den valda kostnadsparametern
+  tmp_res <- run_buffered_engine(df_universe, 
+                                 n_buy = 20, 
+                                 n_sell = 25, 
+                                 cost_pct = c)
+  
+  # Beräkna statistik på nettoavkastningen
+  xts_tmp <- xts(tmp_res$ret_net, order.by = tmp_res$date)
+  
+  # Vi använder decimalform (t.ex. 0.15 för 15%)
+  ann_ret <- as.numeric(Return.annualized(xts_tmp))
+  ann_shrp <- as.numeric(SharpeRatio.annualized(xts_tmp, Rf = 0))
+  
+  stress_results <- rbind(stress_results, data.frame(
+    Cost_Pct = c, 
+    Return = ann_ret, 
+    Sharpe = ann_shrp
+  ))
+}
+
+# 2. VISUALISERING: QUANT 10 - COST SENSITIVITY (SECONDARY AXIS)
+message("📈 Genererar Quant_10: Cost Sensitivity...")
+
+# Vi skalar Sharpe för att passa in i grafen (t.ex. multiplicera med 0.1 för att matcha Return-skalan)
+# eller använder ggplot2:s sec_axis vilket är mer proffsigt.
+
+p_stress <- ggplot(stress_results, aes(x = Cost_Pct)) +
+  # Bars för Return (vänster axel)
+  geom_bar(aes(y = Return, fill = "Annualized Return (Net)"), 
+           stat = "identity", alpha = 0.7, width = 0.0007) +
+  # Linje för Sharpe (höger axel - skalad för att synas)
+  geom_line(aes(y = Sharpe * 0.1, color = "Sharpe Ratio (Right Axis)"), size = 1.2) +
+  geom_point(aes(y = Sharpe * 0.1, color = "Sharpe Ratio (Right Axis)"), size = 3) +
+  
+  # Definiera axlarna
+  scale_y_continuous(
+    name = "Annualized Return",
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, max(stress_results$Return) * 1.2),
+    sec.axis = sec_axis(~ . * 10, name = "Sharpe Ratio", breaks = seq(0, 2, by = 0.2))
+  ) +
+  scale_x_continuous(
+    name = "Transaction Cost / Slippage per Trade",
+    labels = scales::percent_format(accuracy = 0.1),
+    breaks = cost_scenarios
+  ) +
+  
+  # Estetik
+  scale_fill_manual(values = c("Annualized Return (Net)" = "#27AE60")) +
+  scale_color_manual(values = c("Sharpe Ratio (Right Axis)" = "#2C3E50")) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.title.y.right = element_text(color = "#2C3E50", face = "bold"),
+    axis.title.y.left = element_text(color = "#27AE60", face = "bold")
+  ) +
+  labs(
+    title = "Quant 10: Slippage & Capacity Stress Test",
+    subtitle = "Analysis of Alpha Decay relative to Execution Costs",
+    fill = "", color = ""
+  )
+
+# Spara grafen
+ggsave("Quant_10_Stress_Test.pdf", p_stress, width = 10, height = 7)
+
+message("✅ Quant_10 sparad. Resultaten visar nu korrekta procentsatser.")
+
+# ==============================================================================
+# SEKTION O: SMALL PORTFOLIO REALITY CHECK (10k EUR)
+# ==============================================================================
+message("\n💸 --- KÖR SEKTION O: 10k EUR PORTFÖLJ SIMULERING ---")
+
+# 1. DEFINIERA SMÅSPARAR-REALITET
+PORTFOLIO_SIZE <- 10000       # 10 000 EUR
+POSITIONS      <- 10          # Antal aktier (Koncentrerad för att minska courtage)
+TRADE_SIZE     <- PORTFOLIO_SIZE / POSITIONS # 1000 EUR per aktie
+MIN_COMMISSION <- 5           # 5 EUR minicourtage (typiskt Nordnet/Avanza för Finland)
+
+# Beräkna effektiv kostnad i procent
+# 5 EUR på 1000 EUR affär = 0.5% per ben.
+# Köp + Sälj = 1.0% per Trade Roundtrip (utöver spread)
+# I vår motor anger vi cost_pct per *transaktion*, så 0.5%.
+EFFECTIVE_COST <- MIN_COMMISSION / TRADE_SIZE
+message(sprintf("💰 10k Portfölj -> Trade Size: %d EUR -> Effektiv Kostnad: %.2f%% per trade", 
+                TRADE_SIZE, EFFECTIVE_COST * 100))
+
+# 2. KÖR STRATEGIN MED HÖGA KOSTNADER
+# Vi använder buffrad motor för att minimera antalet trades, men kostnaden är nu brutal
+# Vi kör Thesis Strategy Logic (Jan = Con, Feb-Dec = Mom) men med HÖGRE kostnader överallt
+res_small_raw <- run_buffered_engine(df_universe, n_buy = 10, n_sell = 13, cost_pct = EFFECTIVE_COST)
+
+# Vi måste applicera Thesis-logiken (Seasonal + Trend) på detta resultat
+t_ind <- master_data$index %>%
+  mutate(SMA = zoo::rollmean(PX_LAST, k = 12, fill = NA, align = "right"), # Använder 12m SMA som standard här
+         Signal = lag(PX_LAST > SMA))
+
+res_small_thesis <- res_small_raw %>%
+  left_join(t_ind %>% select(date, Signal), by="date") %>%
+  mutate(
+    Month = month(date),
+    # Jan: Con (med extra 1% slippage utöver courtage för small cap spread?)
+    # Låt oss vara snälla och bara köra courtage-krossen först.
+    # Men vänta, Con_Long i Thesis Strategy sattes manuellt ihop.
+    # Här kör vi en förenklad simulering på "Core Momentum" motorn med höga kostnader.
+    # För att vara exakt borde vi köra BÅDA motorerna med höga kostnader och mixa dem.
+    
+    # Förenkling: Vi kör Momentum (Trend Filtered) med 1% courtage.
+    # Detta visar poängen med "Scalability" tillräckligt väl.
+    Ret_Small = if_else(replace_na(Signal, TRUE), ret_net, 0)
+  )
+
+xts_small <- xts(res_small_thesis$Ret_Small, order.by=res_small_thesis$date)
+xts_bench <- mgrs_safe$OMXH25
+
+comp_small <- merge(xts_small, xts_bench)
+colnames(comp_small) <- c("Small Portfolio (10k)", "OMXH25")
+
+# 4. SKAPA GRAF
+pdf("Small_Portfolio_10k_Reality.pdf", width = 10, height = 6)
+charts.PerformanceSummary(comp_small, 
+                          main = "Small Portfolio Reality Check (10k EUR)",
+                          sub = sprintf("Assumed Cost: %.2f%% per trade (Min Comm 5 EUR)", EFFECTIVE_COST*100),
+                          colorset = c("#E74C3C", "#7F8C8D"), # Röd (Varning) & Grå
+                          lwd = 2)
+dev.off()
+
+message("✅ 10k-Simulering klar. Sparad som 'Small_Portfolio_10k_Reality.pdf'")
+print(table.AnnualizedReturns(comp_small))
