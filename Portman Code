@@ -1,11 +1,10 @@
-# ============================================================================== 
-# MASTER SCRIPT: ADAPTIVE MOMENTUM (OMX HELSINKI ALL-SHARE) 
+#  
+# ADAPTIVE MOMENTUM (OMX HELSINKI ALL-SHARE) 
 # Metodologi: Jegadeesh & Titman (1993) - Overlapping Portfolios 
 # Version: FINAL (Includes SPX Benchmark, CAPM & Dynamic Rf & Triple Scenario) 
-# ============================================================================== 
+#  
 
-# 1. SETUP & PAKET 
-# ------------------------------------------------------------------------------ 
+# 1. SETUP & PAKET  
 if (!require("pacman")) install.packages("pacman") 
 pacman::p_load(Rblpapi, tidyverse, tidyquant, PerformanceAnalytics, xts, lubridate, gridExtra) 
 
@@ -29,10 +28,8 @@ TRANS_COST <- 0.0025
 # SEKTION A: DATAHÄMTNING (BLOOMBERG-INTEGRATION & SURVIVORSHIP BIAS)
 # ==============================================================================
 if (DOWNLOAD_NEW_DATA) {
-  message("🔌 Ansluter till Bloomberg...")
   con <- blpConnect()
   # 1. UNIVERSUM (Inkluderar logik för att motverka Survivorship Bias)
-  message("--- FAS 1: Hämtar Universum ---")
   live_members <- bds("HEX Index", "INDX_MWEIGHT")
   live_tickers <- paste(live_members$`Member Ticker and Exchange Code`, "Equity")
   
@@ -47,10 +44,10 @@ if (DOWNLOAD_NEW_DATA) {
                            paste(dead_df$Ticker, "Equity"))
     
     full_universe <- unique(c(live_tickers, dead_tickers))
-    message(paste("✅ Inkluderar", length(dead_tickers), "avlistade bolag från CSV."))
+    message(paste(" Inkluderar", length(dead_tickers), "avlistade bolag från CSV."))
   } else {
     full_universe <- live_tickers
-    message("ℹ️ dead_tickers.csv saknas. Fortsätter med enbart nuvarande indexmedlemmar.")
+    message(" dead_tickers.csv saknas. Fortsätter med enbart nuvarande indexmedlemmar.")
   }
   
   
